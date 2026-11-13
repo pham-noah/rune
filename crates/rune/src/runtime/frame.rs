@@ -542,6 +542,7 @@ impl<S: 'static> Runtime<S> {
         let ended: Vec<_> = self.drag_ends.borrow_mut().drain(..).collect();
         let queue = order_drag_ends(std::mem::take(&mut self.queue), ended, &mut self.drags_open);
         let queue = self.hold_files(queue, ran || self.dirty);
+        crate::marks::mark("f.queue");
         // Something besides a checked live-only event wants this frame's commit, so a change
         // it makes isn't the live-only handler's.
         #[cfg(debug_assertions)]
@@ -549,6 +550,7 @@ impl<S: 'static> Runtime<S> {
         let mut pointer_hover = false;
         for Queued { action, at } in queue {
             let _input = crate::input::time::scope(at);
+            let _ib3 = IbAct(std::time::Instant::now(), format!("{:?}", std::mem::discriminant(&action)));
             pointer_hover |= matches!(action, Action::Hover(_));
             // State may have requested focus on a newly mounted field. Resolve the
             // new tree before routing this frame's text, not after it has gone to
@@ -561,6 +563,7 @@ impl<S: 'static> Runtime<S> {
             if (ran || self.dirty || !tx.scroll_to.is_empty()) && routed {
                 if ran || self.dirty {
                     self.capture_flights(&mut tx);
+        crate::marks::mark("f.flights");
                     if self.settle { tx.settle(); }
                     self.settled |= tx.commit.lands();
                     #[cfg(debug_assertions)]
@@ -609,8 +612,10 @@ impl<S: 'static> Runtime<S> {
         }
         #[cfg(target_os = "linux")]
         self.note_primary_selection();
+        crate::marks::mark("f.actions");
         let mut open_urls = std::mem::take(&mut tx.open_urls);
         self.latch_requests(&mut tx);
+        crate::marks::mark("f.latched");
         // A handler asked for a menu: the hover it takes ends in this commit, not a frame later.
         if self.release_pointer_for_popup() {
             for queued in std::mem::take(&mut self.queue) {
@@ -630,10 +635,12 @@ impl<S: 'static> Runtime<S> {
         self.capture_flights(&mut tx);
         if self.caret_watch && self.caret_moved(None) { self.dirty = true; }
         let read_moved = self.layout_reads_moved();
+        crate::marks::mark("f.reads");
         self.reuse.read_moved = read_moved;
         if self.has_pixel_aspect && self.pixel_aspect_changed() { self.relayout = true; }
         let shifted = !(self.dirty || self.relayout || self.settle) && self.virtual_window_changed();
         let besides = self.dirty || self.relayout || self.settle || shifted;
+        crate::marks::mark("f.virtual");
         let other = ran || besides;
         self.count_layout_echo(ran_layout || read_moved, other);
         if other || ran_layout || read_moved {
@@ -655,11 +662,14 @@ impl<S: 'static> Runtime<S> {
             // Its layout lands too, as an instant change's does: a container that grows to fit what a
             // server brought doesn't ease to its height (motion already running keeps on).
             if tx.unprompted { tx.commit = tx.commit.instant(); }
+            crate::marks::mark("f.commit_for");
             self.commit_for(&tx, why | flag(self.dirty, CommitWhy::DIRTY) | flag(self.relayout, CommitWhy::RELAYOUT) | flag(self.settle, CommitWhy::SETTLE)
                 | flag(shifted, CommitWhy::VIRTUAL) | flag(ran_layout, CommitWhy::LAYOUT) | flag(read_moved, CommitWhy::READ));
             #[cfg(debug_assertions)]
             { let check = self.live_check.take(); self.compare_live_check(check); }
+            crate::marks::mark("f.committed");
             self.apply_keeps();
+            crate::marks::mark("f.kept");
         }
         #[cfg(debug_assertions)]
         { self.live_check = None; }
@@ -693,6 +703,7 @@ impl<S: 'static> Runtime<S> {
             self.step_scroll(0.0);
         }
         if follow { self.follow_caret(); }
+        crate::marks::mark("f.scrolls");
         if !scroll_bottom.is_empty() { self.scroll_to_bottom(scroll_bottom); }
         if !scroll_pages.is_empty() { self.scroll_pages(scroll_pages); }
         if !scroll_offsets.is_empty() { self.scroll_to_offsets(scroll_offsets); }
@@ -708,6 +719,7 @@ impl<S: 'static> Runtime<S> {
         let changes = self.selection_changes();
         self.queue.extend(changes);
         self.update_interaction(None);
+        crate::marks::mark("f.interaction");
         #[cfg(test)]
         if let Some(publish) = tests::MID_FRAME.with(|hook| hook.borrow_mut().take()) { publish(); }
         // Poll and input can publish after the initial wake read without committing. Sample
@@ -720,7 +732,9 @@ impl<S: 'static> Runtime<S> {
         }
         let dt = if self.fit_frame_holds() { 0.0 } else { dt };
         let instant_scroll = tx.commit.snaps() || self.settled;
+        crate::marks::mark("f.pre_motion");
         let animating = self.step_motion(dt, instant_scroll) || live_animating;
+        crate::marks::mark("f.motion");
         self.stats.shaped = self.text.shaped - shaped0;
         let filling = self.virtual_filling();
         if live_animating { self.anim_sources |= AnimSource::LIVE; }
@@ -730,6 +744,7 @@ impl<S: 'static> Runtime<S> {
         self.idle_frame_ends();
         self.interaction_built();
         if !open_urls.is_empty() { self.open_urls(open_urls); }
+        crate::marks::mark("f.end");
         self.animating
     }
 
@@ -826,19 +841,25 @@ impl<S: 'static> Runtime<S> {
         }
         let mut source = |on: bool, bit: u16| { if on { sources |= bit; } on };
         self.begin_exit_mask();
+        crate::marks::ib3_pass("s.build");
         animating |= self.build();
+        crate::marks::ib3_pass("s.built");
         // Compensate drawn motion, leaving unrelated layout and growth springs alone.
         for _ in 0..3 {
             if !self.follow_keeps() { break; }
             animating |= self.build();
         }
         self.finish_keeps();
+        crate::marks::ib3_pass("s.keeps");
         animating |= self.write_drawn_rects();
+        crate::marks::ib3_pass("s.drawn_rects");
         // A selection's edge scroll stepped: it follows the pointer over this layout, and shows.
         if self.laid_edge_scroll() { animating |= self.build(); }
         self.report_at_bottom();
         animating |= self.report_visible_rows();
+        crate::marks::ib3_pass("s.reports");
         self.report_layout();
+        crate::marks::ib3_pass("s.reported");
         // A report waits for the next frame: draw one to deliver it.
         animating |= self.report_drawn() | self.report_visible();
         self.end_exit_mask();
@@ -928,5 +949,14 @@ impl<S: 'static> Runtime<S> {
             }
         }
         if self.layer_paint_order.iter().copied().eq(0..n) { self.layer_paint_order.clear(); }
+    }
+}
+
+/// IB-3 measuring: marks a queued action that took over 200 us, by kind.
+struct IbAct(std::time::Instant, String);
+impl Drop for IbAct {
+    fn drop(&mut self) {
+        let us = self.0.elapsed().as_micros();
+        if us > 200 { crate::marks::mark(Box::leak(format!("f.act:{}:{us}", self.1).into_boxed_str())); }
     }
 }
