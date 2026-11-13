@@ -28,10 +28,27 @@ struct Thinning {
     source: u32,
     /// The list is keyed by its source, so a new source is a new list in its place.
     keyed_by_source: bool,
+    /// Every source's first row is the same header row.
+    header: bool,
+    /// What a third viewport holds: nothing, a one-row index-built list (filled at once), or a
+    /// plain row, keyed by `side_n`, so a new `side_n` mounts a new one in its place.
+    side: Side,
+    side_n: u32,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Side {
+    Nothing,
+    List,
+    Plain,
+}
+
+fn row_key(source: u32, header: bool, i: usize) -> String {
+    if header && i == 0 { "header".to_owned() } else { format!("s{source}r{i}") }
 }
 
 fn thinning() -> Runtime<Thinning> {
-    let state = Thinning { builds: Rc::new(Cell::new(0)), short: false, gone: false, source: 0, keyed_by_source: false };
+    let state = Thinning { builds: Rc::new(Cell::new(0)), short: false, gone: false, source: 0, keyed_by_source: false, header: false, side: Side::Nothing, side_n: 0 };
     Runtime::new(state, thinning_view, (400.0, VIEWPORT), Env::new(true, 2.0))
 }
 
@@ -39,18 +56,18 @@ fn thinning_view(s: &Thinning, _: &mut Cx<Thinning>) -> El {
     if s.gone { return el().key("empty").w_full().h_full(); }
     let builds = s.builds.clone();
     let count = if s.short { 3 } else { ROWS };
-    let source = s.source;
+    let (source, header) = (s.source, s.header);
     let key = if s.keyed_by_source { format!("rows{source}") } else { "rows".to_owned() };
     let list = col().key("scroll").w(300.0).h(VIEWPORT).scroll(ScrollSpec { stick_bottom: false }).child(
         col().key(key).w_full().growth(GrowthSpec::default()).virtual_rows(
             count,
             ROW_H,
-            move |_: &Thinning, i| format!("s{source}r{i}").into(),
+            move |_: &Thinning, i| row_key(source, header, i).into(),
             move |_: &Thinning, i| {
                 let n = builds.get();
                 builds.set(n + 1);
                 let height = if n < 12 { ROW_H } else { THIN };
-                el().key(format!("s{source}r{i}")).w_full().h(height).fill(Color::WHITE)
+                el().key(row_key(source, header, i)).w_full().h(height).fill(Color::WHITE)
             },
         ),
     );
@@ -60,7 +77,18 @@ fn thinning_view(s: &Thinning, _: &mut Cx<Thinning>) -> El {
             (0..60).map(|i| el().key(format!("o{i}")).w_full().h(ROW_H).fill(Color::WHITE)),
         ),
     );
-    crate::row().w_full().h_full().child(list).child(other)
+    let side_key = format!("side{}", s.side_n);
+    let side = col().key("side").w(20.0).h(VIEWPORT).scroll(ScrollSpec { stick_bottom: false }).children(match s.side {
+        Side::Nothing => None,
+        Side::List => Some(col().key(side_key).w_full().growth(GrowthSpec::default()).virtual_rows(
+            1,
+            ROW_H,
+            |_: &Thinning, _| "side".into(),
+            |_: &Thinning, _| el().key("side").w_full().h(ROW_H).fill(Color::WHITE),
+        )),
+        Side::Plain => Some(el().key(side_key).w_full().h(ROW_H).fill(Color::WHITE)),
+    });
+    crate::row().w_full().h_full().child(list).child(other).child(side)
 }
 
 /// Draws while the runtime asks for a frame and wakes at any timer it armed, like a host does.
@@ -247,6 +275,65 @@ fn a_new_source_on_the_old_deadline_starts_its_own_run() {
     assert_ne!(rt.anim_sources & AnimSource::VIRTUAL_FILL, 0, "and its first fill frame draws");
 }
 
+/// r432: the new source shares its first, visible row (a header) with the old one, at the same
+/// path. It is still another source, so its fill is its own run.
+#[test]
+fn a_new_source_sharing_a_visible_header_starts_its_own_run() {
+    let mut rt = thinning();
+    rt.update(|s, _| s.header = true);
+    let due = draw_to_wait(&mut rt);
+    rt.update(|s, _| s.source = 1);
+    rt.frame(1.0 / 120.0);
+    assert!(rt.clock < due, "the frame is before the old source's deadline");
+    assert!(
+        matches!(rt.virtual_fill.state(), State::Filling { frames: 1, resumes: 0, .. }),
+        "the new source starts its own run: {:?}",
+        rt.virtual_fill.state()
+    );
+}
+
+/// r433: a wait that retires before its deadline takes its host timer with it, so nothing wakes
+/// the host for the old source; an app timer due at the same instant still stands.
+#[test]
+fn a_retired_wait_leaves_no_host_timer() {
+    for app_timer in [false, true] {
+        let mut rt = thinning();
+        let due = draw_to_wait(&mut rt);
+        assert_eq!(rt.wake_deadline(), Some(due), "the wait armed its timer");
+        if app_timer { rt.schedule_wakes_from(due, [std::time::Duration::ZERO]); }
+        rt.update(|s, _| s.source = 1);
+        rt.frame(1.0 / 120.0);
+        assert!(rt.clock < due, "the frame is before the old source's deadline");
+        assert!(matches!(rt.virtual_fill.state(), State::Filling { .. }), "the wait retired: {:?}", rt.virtual_fill.state());
+        assert_eq!(rt.wake_deadline(), app_timer.then_some(due), "app timer {app_timer}: only the app's timer is left");
+    }
+}
+
+/// Fill frames over three seconds while a third viewport mounts new content in place of the old
+/// every frame.
+fn fill_draws_beside(side: Side) -> (usize, bool) {
+    let mut rt = thinning();
+    rt.update(|s, _| s.side = side);
+    let (mut draws, mut waited) = (0, false);
+    for _ in 0..360 {
+        rt.update(|s, _| s.side_n += 1);
+        rt.frame(1.0 / 120.0);
+        if rt.anim_sources & AnimSource::VIRTUAL_FILL != 0 { draws += 1; }
+        waited |= matches!(rt.virtual_fill.state(), State::Waiting { .. } | State::Stalled);
+    }
+    (draws, waited)
+}
+
+/// r431: index-built lists that are already filled, mounting beside a fill, ask for no rows, so
+/// they leave its run alone: the fill draws exactly as often as beside plain rows doing the same.
+#[test]
+fn a_filled_list_mounting_beside_a_fill_leaves_its_run_alone() {
+    let (plain, waited) = fill_draws_beside(Side::Plain);
+    assert!(waited, "the fill reached its bound beside the plain row");
+    let (list, _) = fill_draws_beside(Side::List);
+    assert_eq!(list, plain, "fill frames beside a filled list, against beside a plain row");
+}
+
 /// r367: the wake that was waiting comes due after the list finished filling, and draws nothing.
 #[test]
 fn a_wake_after_the_fill_completes_draws_nothing() {
@@ -261,3 +348,4 @@ fn a_wake_after_the_fill_completes_draws_nothing() {
     assert_eq!(rt.anim_sources & AnimSource::VIRTUAL_FILL, 0, "and the fill adds no frame");
     assert_eq!(rt.wake_deadline(), None, "nothing is left armed");
 }
+

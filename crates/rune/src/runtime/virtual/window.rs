@@ -1,7 +1,7 @@
 //! Virtual lists between commits: whether a window wants moving, and which rows show.
 
 use super::*;
-use super::virtual_fill::{Demand, FillEffect, Sources};
+use super::virtual_fill::{FillEffect, Sources};
 
 impl<S: 'static> Runtime<S> {
     pub(super) fn virtual_window_changed(&self) -> bool {
@@ -63,19 +63,17 @@ impl<S: 'static> Runtime<S> {
     }
 
     /// Whether an index-built list wants its window moved, whether one of those lists' own
-    /// viewports moved this frame (another viewport's motion invalidates nothing here), and which
-    /// index-built lists there are with the source each shows, wanting or not, so a list that
-    /// fills and wants again in place still belongs to the same run.
-    fn virtual_demand(&self) -> Demand {
-        let mut demand = Demand { wanted: false, moved: false, sources: Sources::default() };
+    /// viewports moved this frame (another viewport's motion invalidates nothing here), and
+    /// which lists those are, with which rows.
+    fn virtual_demand(&self) -> (bool, bool, Sources) {
+        let (mut wanted, mut moved, mut sources) = (false, false, Sources::default());
         for (path, v) in &self.virtuals {
-            if !v.indexed { continue; }
-            demand.sources.add(v.source());
-            if !self.wants_window(path, v) { continue; }
-            demand.wanted = true;
-            demand.moved |= self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id)).is_some_and(|s| s.moving());
+            if !v.indexed || !self.wants_window(path, v) { continue; }
+            wanted = true;
+            moved |= self.path_ids.get(&v.scroll_path).and_then(|id| self.scrolls.get(id)).is_some_and(|s| s.moving());
+            sources.add(v.source());
         }
-        demand
+        (wanted, moved, sources)
     }
 
     /// Rows an index-built list still has to mount across the lists that want a window moved;
@@ -96,16 +94,26 @@ impl<S: 'static> Runtime<S> {
     /// the unfilled range stops shrinking.
     pub(super) fn virtual_filling(&mut self) -> bool {
         let now = self.clock;
-        let demand = self.virtual_demand();
-        // The fill is a small copy: stepping one keeps `self` free for counting unfilled rows.
+        let (wanted, moved, sources) = self.virtual_demand();
+        // A copy, so counting unfilled rows can borrow `self`.
         let mut fill = self.virtual_fill;
-        let effects = fill.frame(now, demand, || self.virtual_unfilled());
+        let effects = fill.frame(now, wanted, moved, sources, || self.virtual_unfilled());
+        // A wait that retired takes back the host timer it alone armed: nothing wakes for it.
+        if let Some(due) = fill.retired_timer()
+            && let Ok(i) = self.wake_deadlines.binary_search_by(|t| t.total_cmp(&due))
+        {
+            self.wake_deadlines.remove(i);
+        }
         self.virtual_fill = fill;
         let mut draw = false;
         for effect in effects {
             match effect {
                 FillEffect::Draw => draw = true,
-                FillEffect::WakeAt(due) => self.wake_at(due),
+                FillEffect::WakeAt(due) => {
+                    let alone = self.wake_deadlines.binary_search_by(|t| t.total_cmp(&due)).is_err();
+                    self.wake_at(due);
+                    self.virtual_fill.timer_armed(due, alone);
+                }
             }
         }
         draw

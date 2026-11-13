@@ -1,8 +1,8 @@
 //! The fill machine against origin/dev's counter, and the wait that resumes a starved fill.
-use super::{Demand, FILL_FRAMES, Fill, FillEffect, FillEvent, RESUME_LIMIT, Sources, State};
+use super::{FILL_FRAMES, Fill, FillEffect, FillEvent, RESUME_LIMIT, Sources, State};
 use crate::machine::{Attempt, Effects};
 
-/// The lists one source shows, and the lists after another source replaced it.
+/// The lists asking for rows, and other lists (or the same with other rows) in their place.
 const A: Sources = Sources(1);
 const B: Sources = Sources(2);
 
@@ -30,28 +30,33 @@ fn sequence(bits: u32, len: usize) -> String {
 fn run_to_bound(fill: &mut Fill, now: f64, missing: usize) -> Option<(f64, Attempt)> {
     for _ in 0..FILL_FRAMES + 2 {
         let count = if fill.at_bound() { missing } else { 0 };
-        for effect in fill.step(FillEvent::Frame { now, wanted: true, missing: count, moved: false, sources: A }) {
+        for effect in fill.step(FillEvent::Frame { now, wanted: true, missing: count, moved: false }) {
             if let FillEffect::WakeAt(due) = effect
                 && let State::Waiting { attempt, .. } = fill.state()
             {
                 return Some((due, attempt));
             }
         }
-        if matches!(fill.state(), State::Idle | State::Stalled { .. }) { return None; }
+        if matches!(fill.state(), State::Idle | State::Stalled) { return None; }
     }
     None
 }
 
-/// One frame as `Runtime::virtual_filling` runs it, through [`Fill::frame`]: the fill's own
-/// deadline draws for itself, a stale one draws nothing, and any other frame counts as a fill
-/// frame. Returns whether it drew.
+/// One frame as `Runtime::virtual_filling` runs it: the fill's own deadline draws for itself, a
+/// stale one draws nothing, and any other frame counts as a fill frame. Returns whether it drew.
 fn frame(fill: &mut Fill, now: f64, missing: usize, deadlines: &mut Vec<f64>) -> bool {
-    let effects = fill.frame(now, Demand { wanted: true, moved: false, sources: A }, || missing);
-    let drew = effects.clone().into_iter().any(|e| e == FillEffect::Draw);
-    for effect in effects {
-        if let FillEffect::WakeAt(due) = effect { deadlines.push(due); }
+    match fill.wake(now) {
+        Some(attempt) => !fill.step(FillEvent::Due { attempt, now }).is_empty(),
+        None => {
+            let count = if fill.at_bound() { missing } else { 0 };
+            let effects = fill.step(FillEvent::Frame { now, wanted: true, missing: count, moved: false });
+            let drew = effects.clone().into_iter().any(|e| e == FillEffect::Draw);
+            for effect in effects {
+                if let FillEffect::WakeAt(due) = effect { deadlines.push(due); }
+            }
+            drew
+        }
     }
-    drew
 }
 
 /// Every sequence of frames up to two past the bound, each driven through `step` and its answer
@@ -66,7 +71,7 @@ fn every_run_of_frames_draws_what_dev_draws() {
             let (mut fill, mut dev) = (Fill::default(), Dev { virtual_fill: 0 });
             for (i, wanted) in (0..len).map(|i| (i, bits >> i & 1 == 1)) {
                 let missing = if fill.at_bound() { 1 } else { 0 };
-                let drew = fill.step(FillEvent::Frame { now: 0.0, wanted, missing, moved: false, sources: A }).into_iter().any(|e| e == FillEffect::Draw);
+                let drew = fill.step(FillEvent::Frame { now: 0.0, wanted, missing, moved: false }).into_iter().any(|e| e == FillEffect::Draw);
                 assert_eq!(
                     drew,
                     dev.frame(wanted),
@@ -85,14 +90,14 @@ fn a_settled_frame_forgets_the_run_and_the_bound_stops_it() {
     let mut fill = Fill::default();
     let frame = |fill: &mut Fill, wanted: bool| {
         let missing = if fill.at_bound() { 8 } else { 0 };
-        fill.step(FillEvent::Frame { now: 0.0, wanted, missing, moved: false, sources: A }).into_iter().any(|e| e == FillEffect::Draw)
+        fill.step(FillEvent::Frame { now: 0.0, wanted, missing, moved: false }).into_iter().any(|e| e == FillEffect::Draw)
     };
     let drew: Vec<bool> = (0..FILL_FRAMES as usize + 1).map(|_| frame(&mut fill, true)).collect();
     assert!(drew[..FILL_FRAMES as usize].iter().all(|d| *d), "the first {FILL_FRAMES} frames draw: {drew:?}");
     assert!(!drew[FILL_FRAMES as usize], "the bound stops drawing: {drew:?}");
     // // differs from dev: the bound leaves a wait behind, not a spent count.
     assert!(matches!(fill.state(), State::Waiting { .. }), "the bound waits: {:?}", fill.state());
-    assert!(fill.step(FillEvent::Frame { now: 0.0, wanted: false, missing: 0, moved: false, sources: A }).is_empty());
+    assert!(fill.step(FillEvent::Frame { now: 0.0, wanted: false, missing: 0, moved: false }).is_empty());
     assert_eq!(fill.state(), State::Idle, "a frame with nothing to fill settles it");
     assert!(frame(&mut fill, true), "a settled list asks again at once");
 }
@@ -109,15 +114,15 @@ fn the_bound_waits_and_the_wake_resumes_the_fill() {
     assert!(fill.resuming(due));
 
     // A stale wake: an attempt the state never issued changes nothing.
-    assert!(fill.step(FillEvent::Due { attempt: Attempt(999), now: 2.0, sources: A }).is_empty());
+    assert!(fill.step(FillEvent::Due { attempt: Attempt(999), now: 2.0 }).is_empty());
     assert_eq!(fill.state(), waiting);
 
     // A frame drawn for another cause while the fill waits: no draw, no reset.
-    assert!(fill.step(FillEvent::Frame { now: 1.5, wanted: true, missing: 4, moved: false, sources: A }).is_empty());
+    assert!(fill.step(FillEvent::Frame { now: 1.5, wanted: true, missing: 4, moved: false }).is_empty());
     assert_eq!(fill.state(), waiting, "a redraw changes nothing");
 
     // Its own wake resumes the run it was waiting in.
-    let effects = fill.step(FillEvent::Due { attempt, now: due, sources: A });
+    let effects = fill.step(FillEvent::Due { attempt, now: due });
     assert!(effects.into_iter().any(|e| e == FillEffect::Draw), "the wake draws again");
     assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 1, .. }), "{:?}", fill.state());
 }
@@ -133,18 +138,18 @@ fn a_starved_fill_stops_after_its_resumes_without_progress() {
         waits.push(due - now);
         now = due;
         assert!(waits.len() <= RESUME_LIMIT as usize, "resumes are bounded: {waits:?}");
-        assert!(!fill.step(FillEvent::Due { attempt, now, sources: A }).is_empty(), "the wake resumes it");
+        assert!(!fill.step(FillEvent::Due { attempt, now }).is_empty(), "the wake resumes it");
     }
     assert_eq!(waits.len(), RESUME_LIMIT as usize, "resumes are bounded: {waits:?}");
     assert!(waits.windows(2).all(|w| w[1] > w[0]), "each resume backs off: {waits:?}");
-    assert_eq!(fill.state(), State::Stalled { sources: A }, "and the fill stops asking");
+    assert_eq!(fill.state(), State::Stalled, "and the fill stops asking");
     assert!(!fill.resuming(now + 100.0), "nothing is left armed");
     // Redraws and stale deadlines after it change nothing.
     for _ in 0..5 {
-        assert!(fill.step(FillEvent::Frame { now: now + 1.0, wanted: true, missing: 8, moved: false, sources: A }).is_empty());
-        assert!(fill.step(FillEvent::Due { attempt: Attempt(999), now: now + 1.0, sources: A }).is_empty());
+        assert!(fill.step(FillEvent::Frame { now: now + 1.0, wanted: true, missing: 8, moved: false }).is_empty());
+        assert!(fill.step(FillEvent::Due { attempt: Attempt(999), now: now + 1.0 }).is_empty());
     }
-    assert_eq!(fill.state(), State::Stalled { sources: A });
+    assert_eq!(fill.state(), State::Stalled);
 }
 
 /// The reviewer's replay, 36,001 ticks at 359.94 Hz: wanted true with the same eight rows missing
@@ -168,7 +173,7 @@ fn stale_deadlines_never_restart_the_fill() {
         if draw { drawn += 1; }
     }
     assert!(drawn <= 4 * FILL_FRAMES as usize + 4, "the fill stopped drawing: {drawn} frames of {frames}");
-    assert_eq!(fill.state(), State::Stalled { sources: A }, "and it stays stalled");
+    assert_eq!(fill.state(), State::Stalled, "and it stays stalled");
     assert!(deadlines.is_empty(), "no deadline is left armed: {deadlines:?}");
 }
 
@@ -180,14 +185,14 @@ fn a_wake_after_the_list_is_gone_draws_nothing() {
     assert!(matches!(fill.state(), State::Waiting { .. }));
 
     // The list finishes or unmounts: the wait retires with it, and its deadline is forgotten.
-    assert!(fill.step(FillEvent::Frame { now: 0.1, wanted: false, missing: 0, moved: false, sources: A }).is_empty());
+    assert!(fill.step(FillEvent::Frame { now: 0.1, wanted: false, missing: 0, moved: false }).is_empty());
     assert_eq!(fill.state(), State::Idle);
     assert!(!fill.resuming(due), "a retired deadline resumes nothing");
     assert_eq!(fill.wake(due), None, "the deadline it left is no longer the fill's");
-    assert!(fill.step(FillEvent::Due { attempt, now: due, sources: A }).is_empty(), "and draws nothing");
+    assert!(fill.step(FillEvent::Due { attempt, now: due }).is_empty(), "and draws nothing");
     assert_eq!(fill.state(), State::Idle);
     // A list that replaces it starts exactly as one that was never here: its first frame draws.
-    assert!(fill.step(FillEvent::Frame { now: due + 1.0, wanted: true, missing: 8, moved: false, sources: A })
+    assert!(fill.step(FillEvent::Frame { now: due + 1.0, wanted: true, missing: 8, moved: false })
         .into_iter().any(|e| e == FillEffect::Draw));
 }
 
@@ -203,7 +208,7 @@ fn a_resume_that_finds_progress_gets_a_fresh_bound() {
         wakes += 1;
         now = due;
         missing = missing.saturating_sub(6);
-        assert!(!fill.step(FillEvent::Due { attempt, now, sources: A }).is_empty());
+        assert!(!fill.step(FillEvent::Due { attempt, now }).is_empty());
         assert!(wakes <= 8, "progress keeps it going: {wakes}");
     }
     assert!(wakes > RESUME_LIMIT as usize, "the shrinking range earned more resumes: {wakes}");
@@ -217,63 +222,85 @@ fn a_moved_viewport_starts_the_fill_again() {
     let mut now = 0.0;
     while let Some((due, attempt)) = run_to_bound(&mut fill, now, 8) {
         now = due;
-        fill.step(FillEvent::Due { attempt, now, sources: A });
+        fill.step(FillEvent::Due { attempt, now });
     }
-    assert_eq!(fill.state(), State::Stalled { sources: A });
-    assert!(fill.step(FillEvent::Frame { now: now + 1.0, wanted: true, missing: 8, moved: false, sources: A }).is_empty());
-    assert_eq!(fill.state(), State::Stalled { sources: A }, "a redraw leaves it stalled");
-    let effects: Effects<FillEffect> = fill.step(FillEvent::Frame { now: now + 2.0, wanted: true, missing: 8, moved: true, sources: A });
+    assert_eq!(fill.state(), State::Stalled);
+    assert!(fill.step(FillEvent::Frame { now: now + 1.0, wanted: true, missing: 8, moved: false }).is_empty());
+    assert_eq!(fill.state(), State::Stalled, "a redraw leaves it stalled");
+    let effects: Effects<FillEffect> = fill.step(FillEvent::Frame { now: now + 2.0, wanted: true, missing: 8, moved: true });
     assert!(effects.into_iter().any(|e| e == FillEffect::Draw), "a scroll starts it again");
     assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, .. }), "{:?}", fill.state());
 }
 
-/// r374: a list in another's place, or showing another source, starts its own run whatever the
-/// old run was doing: filling, waiting or stalled.
-#[test]
-fn another_source_starts_its_own_run() {
-    let mut fill = Fill::default();
-    for _ in 0..3 {
-        fill.step(FillEvent::Frame { now: 0.0, wanted: true, missing: 0, moved: false, sources: A });
-    }
-    assert!(matches!(fill.state(), State::Filling { frames: 3, sources: A, .. }), "{:?}", fill.state());
-    let effects = fill.step(FillEvent::Frame { now: 0.0, wanted: true, missing: 0, moved: false, sources: B });
-    assert!(effects.into_iter().any(|e| e == FillEffect::Draw));
-    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, sources: B, .. }), "filling: {:?}", fill.state());
+/// One wanted frame through [`Fill::frame`] with `sources` asking and `missing` rows unfilled.
+fn wanted(fill: &mut Fill, now: f64, sources: Sources, missing: usize) -> Effects<FillEffect> {
+    fill.frame(now, true, false, sources, || missing)
+}
 
+/// r374: other lists asking, or the same lists with other rows, start their own run whatever
+/// the old run was doing: filling, waiting or stalled.
+#[test]
+fn other_sources_start_their_own_run() {
+    let drew = |effects: Effects<FillEffect>| effects.into_iter().any(|e| e == FillEffect::Draw);
     let mut fill = Fill::default();
-    let (due, _) = run_to_bound(&mut fill, 0.0, 8).expect("the bound asks for a wake");
-    let effects = fill.step(FillEvent::Frame { now: 0.01, wanted: true, missing: 8, moved: false, sources: B });
-    assert!(effects.into_iter().any(|e| e == FillEffect::Draw), "waiting: the new source draws at once");
-    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, best: usize::MAX, sources: B }), "{:?}", fill.state());
-    assert!(!fill.resuming(due), "and the old source's deadline is gone");
+    for _ in 0..3 { wanted(&mut fill, 0.0, A, 8); }
+    assert!(matches!(fill.state(), State::Filling { frames: 3, .. }), "{:?}", fill.state());
+    assert!(drew(wanted(&mut fill, 0.0, B, 8)));
+    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, .. }), "filling: {:?}", fill.state());
 
     let mut fill = Fill::default();
     let mut now = 0.0;
-    while let Some((due, attempt)) = run_to_bound(&mut fill, now, 8) {
-        now = due;
-        fill.step(FillEvent::Due { attempt, now, sources: A });
+    while !matches!(fill.state(), State::Waiting { .. }) { wanted(&mut fill, now, A, 8); now += 0.001; }
+    let State::Waiting { due, .. } = fill.state() else { unreachable!() };
+    assert!(drew(wanted(&mut fill, now, B, 8)), "waiting: the new lists draw at once");
+    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, best: usize::MAX }), "{:?}", fill.state());
+    assert!(!fill.resuming(due), "and the old wait's deadline is gone");
+    assert_eq!(fill.retired_timer(), None, "it armed no host timer here");
+
+    let mut fill = Fill::default();
+    let mut now = 0.0;
+    for _ in 0..200 {
+        if let State::Waiting { due, .. } = fill.state() { now = due; }
+        wanted(&mut fill, now, A, 8);
     }
-    assert_eq!(fill.state(), State::Stalled { sources: A });
-    let effects = fill.step(FillEvent::Frame { now: now + 1.0, wanted: true, missing: 8, moved: false, sources: B });
-    assert!(effects.into_iter().any(|e| e == FillEffect::Draw), "stalled: the new source draws at once");
-    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, sources: B, .. }), "{:?}", fill.state());
+    assert_eq!(fill.state(), State::Stalled, "resumes without progress ran out");
+    assert!(wanted(&mut fill, now + 1.0, A, 8).is_empty(), "stalled: a redraw draws nothing");
+    assert!(drew(wanted(&mut fill, now + 1.0, B, 8)), "stalled: the new lists draw at once");
+    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, .. }), "{:?}", fill.state());
 }
 
-/// r374: the old source's deadline comes due in the frame that finds the new source. That frame
-/// is the new run's first, not a resume of the old run.
+/// r374: the old wait's deadline comes due in the frame that finds new lists. That frame is
+/// their run's first, not a resume of the old one.
 #[test]
-fn the_old_deadline_in_a_new_source_frame_starts_its_own_run() {
+fn the_old_deadline_in_a_frame_for_other_lists_starts_their_run() {
     let mut fill = Fill::default();
     let (due, _) = run_to_bound(&mut fill, 0.0, 8).expect("the bound asks for a wake");
-    let effects = fill.frame(due, Demand { wanted: true, moved: false, sources: B }, || unreachable!("no bound reached"));
-    assert!(effects.into_iter().any(|e| e == FillEffect::Draw));
-    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, best: usize::MAX, sources: B }), "{:?}", fill.state());
+    // `run_to_bound` steps the machine directly: the frames were for A.
+    fill.sources = A;
+    assert!(wanted(&mut fill, due, B, 8).into_iter().any(|e| e == FillEffect::Draw));
+    assert!(matches!(fill.state(), State::Filling { frames: 1, resumes: 0, best: usize::MAX }), "{:?}", fill.state());
+}
+
+/// r433: the host timer a wait armed is the fill's to take back once the wait is gone, unless
+/// another timer was armed at the same instant.
+#[test]
+fn a_retired_wait_hands_back_only_a_timer_it_alone_armed() {
+    for shared in [false, true] {
+        let mut fill = Fill::default();
+        let (due, _) = run_to_bound(&mut fill, 0.0, 8).expect("the bound asks for a wake");
+        fill.timer_armed(due, true);
+        if shared { fill.timer_shared(due); }
+        assert_eq!(fill.retired_timer(), None, "the wait still holds its timer");
+        wanted(&mut fill, 0.01, B, 8);
+        assert_eq!(fill.retired_timer(), (!shared).then_some(due), "shared {shared}");
+        assert_eq!(fill.retired_timer(), None, "and only once");
+    }
 }
 
 /// origin/dev's fill (`runtime/virtual/fill.rs`) and the half of `Runtime::virtual_filling`
 /// after it read the lists (`runtime/virtual/window.rs`), transcribed as they were, with plain
-/// numbers for attempts and its constants written out. It is never edited to fit the branch:
-/// a walk that fails means the branch differs from dev. Each `// differs from dev:` marks an
+/// numbers for attempts and its constants written out. It is never edited to fit the branch: a
+/// walk that fails means the branch differs from dev. Each `// differs from dev:` marks an
 /// approved change.
 mod reference {
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -286,8 +313,8 @@ mod reference {
 
     #[derive(Clone, Copy)]
     enum Event {
-        Frame { now: f64, wanted: bool, missing: usize, moved: bool, sources: u64 },
-        Due { attempt: u32, now: f64, sources: u64 },
+        Frame { now: f64, wanted: bool, missing: usize, moved: bool },
+        Due { attempt: u32, now: f64 },
     }
 
     #[derive(Clone, Copy, PartialEq)]
@@ -300,8 +327,8 @@ mod reference {
         pub(super) state: State,
         seq: u32,
         pub(super) wake: Option<(u32, f64)>,
-        // differs from dev: the sources the run started for.
-        pub(super) sources: u64,
+        // differs from dev: the lists the last wanted frame found asking.
+        sources: u64,
     }
 
     impl Dev {
@@ -332,23 +359,12 @@ mod reference {
                     self.state = State::Idle;
                     vec![]
                 }
-                (_, Event::Frame { wanted: true, moved: true, sources, .. }) => {
+                (_, Event::Frame { wanted: true, moved: true, .. }) => {
                     self.state = State::Filling { frames: 1, best: usize::MAX, resumes: 0 };
-                    // differs from dev: the run notes the sources it started for.
-                    self.sources = sources;
                     vec![Effect::Draw]
                 }
-                // differs from dev: a frame for other sources than the run's starts a new run,
-                // whatever the old one was doing.
-                (state, Event::Frame { wanted: true, sources, .. }) if state != State::Idle && sources != self.sources => {
+                (State::Idle, Event::Frame { wanted: true, .. }) => {
                     self.state = State::Filling { frames: 1, best: usize::MAX, resumes: 0 };
-                    self.sources = sources;
-                    vec![Effect::Draw]
-                }
-                (State::Idle, Event::Frame { wanted: true, sources, .. }) => {
-                    self.state = State::Filling { frames: 1, best: usize::MAX, resumes: 0 };
-                    // differs from dev: the run notes the sources it started for.
-                    self.sources = sources;
                     vec![Effect::Draw]
                 }
                 (State::Filling { frames, best, resumes }, Event::Frame { now, wanted: true, missing, .. }) => {
@@ -375,16 +391,7 @@ mod reference {
                     vec![Effect::WakeAt(due)]
                 }
                 (State::Waiting { .. } | State::Stalled, Event::Frame { wanted: true, .. }) => vec![],
-                (State::Waiting { attempt, due, best, resumes }, Event::Due { attempt: a, now, sources })
-                    if attempt == a && now >= due =>
-                {
-                    // differs from dev: the deadline comes due in a frame for other sources,
-                    // which starts their own run instead of resuming this one.
-                    if sources != self.sources {
-                        self.state = State::Filling { frames: 1, best: usize::MAX, resumes: 0 };
-                        self.sources = sources;
-                        return vec![Effect::Draw];
-                    }
+                (State::Waiting { attempt, due, best, resumes }, Event::Due { attempt: a, now }) if attempt == a && now >= due => {
                     self.state = State::Filling { frames: 1, best, resumes };
                     vec![Effect::Draw]
                 }
@@ -396,16 +403,22 @@ mod reference {
         /// armed, and whether it counted the unfilled rows.
         pub(super) fn virtual_filling(&mut self, now: f64, wanted: bool, moved: bool, sources: u64, unfilled: usize) -> (bool, Vec<f64>, bool) {
             if !wanted {
-                self.step(Event::Frame { now, wanted: false, missing: 0, moved: false, sources });
+                self.step(Event::Frame { now, wanted: false, missing: 0, moved: false });
                 return (false, vec![], false);
             }
+            // differs from dev: other lists asking retire the run, as a frame with nothing
+            // wanted between would.
+            if sources != self.sources {
+                self.step(Event::Frame { now, wanted: false, missing: 0, moved: false });
+                self.sources = sources;
+            }
             if let Some(attempt) = self.wake(now) {
-                return (!self.step(Event::Due { attempt, now, sources }).is_empty(), vec![], false);
+                return (!self.step(Event::Due { attempt, now }).is_empty(), vec![], false);
             }
             let counted = self.at_bound();
             let missing = if counted { unfilled } else { 0 };
             let (mut draw, mut wakes) = (false, vec![]);
-            for effect in self.step(Event::Frame { now, wanted, missing, moved, sources }) {
+            for effect in self.step(Event::Frame { now, wanted, missing, moved }) {
                 match effect {
                     Effect::Draw => draw = true,
                     Effect::WakeAt(due) => wakes.push(due),
@@ -415,7 +428,6 @@ mod reference {
         }
     }
 }
-
 /// One frame of a walk.
 #[derive(Clone, Copy)]
 struct Step {
@@ -483,8 +495,7 @@ fn check_walk(walk: &str) {
                 (false, _) => now + 1.0 / 120.0,
             };
             let counted = Cell::new(false);
-            let demand = Demand { wanted: step.wanted, moved: step.moved, sources: Sources(step.sources) };
-            let effects = fill.frame(now, demand, || {
+            let effects = fill.frame(now, step.wanted, step.moved, Sources(step.sources), || {
                 counted.set(true);
                 missing
             });
@@ -496,11 +507,11 @@ fn check_walk(walk: &str) {
             assert_eq!(fill.wake.map(|(_, due)| due), dev.wake.map(|(_, due)| due), "armed deadline at {at}");
             let same = match (fill.state(), dev.state) {
                 (State::Idle, reference::State::Idle) => true,
-                (State::Filling { frames, best, resumes, sources }, reference::State::Filling { frames: f, best: b, resumes: r }) =>
-                    (frames, best, resumes, sources) == (f, b, r, Sources(dev.sources)),
-                (State::Waiting { due, best, resumes, sources, .. }, reference::State::Waiting { due: d, best: b, resumes: r, .. }) =>
-                    (due, best, resumes, sources) == (d, b, r, Sources(dev.sources)),
-                (State::Stalled { sources }, reference::State::Stalled) => sources == Sources(dev.sources),
+                (State::Filling { frames, best, resumes }, reference::State::Filling { frames: f, best: b, resumes: r }) =>
+                    (frames, best, resumes) == (f, b, r),
+                (State::Waiting { due, best, resumes, .. }, reference::State::Waiting { due: d, best: b, resumes: r, .. }) =>
+                    (due, best, resumes) == (d, b, r),
+                (State::Stalled, reference::State::Stalled) => true,
                 _ => false,
             };
             assert!(same, "state at {at}");
